@@ -222,17 +222,11 @@ S_pp_entersubcv_noargs(pTHX)
 static I32 count = 0;
 static I32 total = 0;
 
-STATIC void
-optimize_entersub(pTHX_ OP *entersubop, AV * const comppad_name)
-#define optimize_entersub(o, av) optimize_entersub(aTHX_ o, av)
+STATIC OP*
+THX_find_entersub_last_op(pTHX_ OP* entersubop)
+#define find_entersub_last_op(o) THX_find_entersub_last_op(aTHX_ o)
 {
-    OP * aop = cUNOPx(entersubop)->op_first;
-    OP * gvop;
-    CV * cv;
-    HV * stash;
-
-    total++;
-
+    OP *aop = cUNOPx(entersubop)->op_first;
     if (!aop->op_sibling)
        aop = cUNOPx(aop)->op_first;
 
@@ -242,7 +236,24 @@ optimize_entersub(pTHX_ OP *entersubop, AV * const comppad_name)
     while ( aop && aop->op_type == OP_NULL ) {
         aop = cUNOPx(aop)->op_first;
     }
-    
+
+    return aop;
+}
+
+STATIC void
+optimize_entersub(pTHX_ OP *entersubop, AV * const comppad_name)
+#define optimize_entersub(o, av) optimize_entersub(aTHX_ o, av)
+{
+    OP * aop = find_entersub_last_op(entersubop);
+    OP * gvop;
+    CV * cv;
+    HV * stash;
+
+
+    if (!aop) {
+        return;
+    }
+
     /* XXX Does removing the refgen cause any freeing issues..? */
     if ( aop->op_type == OP_REFGEN ) { /* sub {...}->() */
         /* We can throw away the refgen and replace the entersub with a cv variant */
@@ -363,6 +374,7 @@ optimize_entersub(pTHX_ OP *entersubop, AV * const comppad_name)
                 
                 op_null(orig_aop);
                 orig_aop->op_next = (OP*)newSVOP(OP_CONST, 0, (SV*)cv);
+                cUNOPx(orig_aop)->op_first = orig_aop->op_next; 
                 orig_aop->op_next->op_next = entersubop;
                 entersubop->op_type   = OP_ENTERSUB;
 
@@ -412,6 +424,7 @@ static OP *(*nxck_entersubop)(pTHX_ OP *o);
 static OP *(*nxck_exists)(pTHX_ OP *o);
 static OP *(*nxck_defined)(pTHX_ OP *o);
 
+/* XXX TODO sub foo {} defined &foo; can be optimized out */
 
 /* Damn silly. exists(&foo) doesn't handle &foo being constant-folded */
 STATIC OP*
@@ -424,6 +437,17 @@ myck_exists(pTHX_ OP *o)
         if (kid->op_type == OP_NULL && kid->op_targ == OP_ENTERSUB) {
             op_null(o);
             return (OP*)newSVOP(OP_CONST, 0, (SV*)&PL_sv_yes);
+        }
+        else if ( kid->op_type == OP_ENTERSUB ) {
+            OP * aop = find_entersub_last_op(kid);
+            SV * sv;
+            
+            if ( aop && aop->op_type == OP_CONST && (sv = cSVOPx_sv(aop)) ) {
+                if ( SvOK(sv) && SvTYPE(sv) == SVt_PVCV ) {
+                    op_null(o);
+                    return (OP*)newSVOP(OP_CONST, 0, (SV*)&PL_sv_yes);
+                }
+            }
         }
     }
 
@@ -439,6 +463,17 @@ myck_defined(pTHX_ OP *o)
         if (first->op_type == OP_NULL && first->op_targ == OP_ENTERSUB) {
             op_null(o);
             return (OP*)newSVOP(OP_CONST, 0, (SV*)&PL_sv_yes);
+        }
+        else if ( first->op_type == OP_ENTERSUB ) {
+            OP * aop = find_entersub_last_op(first);
+            SV * sv;
+            
+            if ( aop && aop->op_type == OP_CONST && (sv = cSVOPx_sv(aop)) ) {
+                if ( SvOK(sv) && SvTYPE(sv) == SVt_PVCV ) {
+                    op_null(o);
+                    return (OP*)newSVOP(OP_CONST, 0, (SV*)&PL_sv_yes);
+                }
+            }
         }
     }
     
