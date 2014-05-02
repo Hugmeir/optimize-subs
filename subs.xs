@@ -311,15 +311,11 @@ optimize_entersub(pTHX_ OP *entersubop, AV * const comppad_name)
                 gvop = cUNOPx(gvop)->op_first;
             }
             
-            if (!gvop) {
-                break;
-            }
-            
-            if ( gvop->op_type != OP_GV || constop->op_type != OP_CONST ) {
+            if (!gvop || gvop->op_type != OP_GV || constop->op_type != OP_CONST ) {
                break;
             }
             
-            sv = cSVOPx(constop)->op_sv;
+            sv = cSVOPx_sv(constop);
             if ( !sv || sv == &PL_sv_undef ) {
                 break;
             }
@@ -335,11 +331,11 @@ optimize_entersub(pTHX_ OP *entersubop, AV * const comppad_name)
         }
         case OP_GV: /* foo() */
         {
-            GV *gv = MUTABLE_GV(cSVOPx(gvop)->op_sv);
+            GV *gv = cGVOPx_gv(gvop);
 
             if (isGV(gv) && (cv = GvCV(gv)) && !CvLVALUE(cv)) {
                 got_cv:
-                if ( !CvISXSUB(cv) && !CvROOT(cv) ) {
+                if ( !CvISXSUB(cv) && (!CvROOT(cv) || !CvPADLIST(cv)) ) {
                     /* XXX Predeclared subs used before their definition, as well
                      * as autoloaded subs
                      */
@@ -353,12 +349,22 @@ optimize_entersub(pTHX_ OP *entersubop, AV * const comppad_name)
                     }
                 }
                 
+                SV *maybe_const;
+                if ( CvCONST(cv) && (maybe_const = cv_const_sv(cv)) ) {
+                    OP *new_op = newSVOP(OP_CONST, 0, SvREFCNT_inc_simple_NN(maybe_const));
+
+                    new_op->op_next = entersubop;
+                    op_null(entersubop);
+                    entersubop->op_next = new_op;
+                    cUNOPx(entersubop)->op_first = entersubop->op_next;
+
+                    return;
+                }
+                
                 op_null(orig_aop);
                 orig_aop->op_next = (OP*)newSVOP(OP_CONST, 0, (SV*)cv);
                 orig_aop->op_next->op_next = entersubop;
                 entersubop->op_type   = OP_ENTERSUB;
-
-                op_dump(entersubop);
 
                 /* Prevent anything from freeing this CV */
                 /* XXX This should probably only happen once? */
@@ -390,7 +396,10 @@ optimize_entersub(pTHX_ OP *entersubop, AV * const comppad_name)
             break;
         }
         */
+        default: /* $foo->baz(), $foo[0]->(), $foo{bar}->(), $foo->$bar() */
+            break;
     }
+    return;
 }
 
 void
@@ -400,6 +409,41 @@ doof(pTHX_)
 }
 
 static OP *(*nxck_entersubop)(pTHX_ OP *o);
+static OP *(*nxck_exists)(pTHX_ OP *o);
+static OP *(*nxck_defined)(pTHX_ OP *o);
+
+
+/* Damn silly. exists(&foo) doesn't handle &foo being constant-folded */
+STATIC OP*
+myck_exists(pTHX_ OP *o)
+{
+    dVAR;
+    
+    if (o->op_flags & OPf_KIDS) {
+        OP * const kid = cUNOPo->op_first;
+        if (kid->op_type == OP_NULL && kid->op_targ == OP_ENTERSUB) {
+            op_null(o);
+            return (OP*)newSVOP(OP_CONST, 0, (SV*)&PL_sv_yes);
+        }
+    }
+
+    
+    return nxck_exists(aTHX_ o);
+}
+
+STATIC OP*
+myck_defined(pTHX_ OP *o)
+{
+    if ((o->op_flags & OPf_KIDS)) {
+        OP * first = cUNOPo->op_first;
+        if (first->op_type == OP_NULL && first->op_targ == OP_ENTERSUB) {
+            op_null(o);
+            return (OP*)newSVOP(OP_CONST, 0, (SV*)&PL_sv_yes);
+        }
+    }
+    
+    return nxck_defined(aTHX_ o);
+}
 
 STATIC OP*
 myck_entersubop(pTHX_ OP *entersubop)
@@ -436,17 +480,23 @@ PROTOTYPES: DISABLE
 
 BOOT:
 {
-    nxck_entersubop       = PL_check[OP_ENTERSUB];
+    nxck_entersubop = PL_check[OP_ENTERSUB];
+    nxck_exists     = PL_check[OP_EXISTS];
+    nxck_defined    = PL_check[OP_DEFINED];
 }
 
 void
 import(SV *classname)
 CODE:
     PL_check[OP_ENTERSUB] = myck_entersubop;
+    PL_check[OP_EXISTS]   = myck_exists;
+    PL_check[OP_DEFINED]  = myck_defined;
 
 
 void
 unimport(SV *classname)
 CODE:
     PL_check[OP_ENTERSUB] = nxck_entersubop;
+    PL_check[OP_EXISTS]   = nxck_exists;
+    PL_check[OP_DEFINED]  = nxck_defined;
     doof();
